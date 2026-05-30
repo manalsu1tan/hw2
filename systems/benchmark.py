@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import math
+import statistics
+import timeit
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
 
 
 @dataclass(frozen=True)
@@ -57,12 +61,32 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def build_model(config: BenchmarkConfig) -> torch.nn.Module:
     """Instantiate the staff Basics transformer for the requested model size."""
-    raise NotImplementedError
+    from basics.model import BasicsTransformerLM
+
+    spec = MODEL_SPECS[config.model_size]
+    model = BasicsTransformerLM(
+        vocab_size=config.vocab_size,
+        context_length=config.context_length,
+        d_model=spec.d_model,
+        num_layers=spec.num_layers,
+        num_heads=spec.num_heads,
+        d_ff=spec.d_ff,
+        rope_theta=10_000.0,
+    )
+    if config.compile_model:
+        model = torch.compile(model)
+    return model
 
 
 def make_random_batch(config: BenchmarkConfig, device: torch.device) -> torch.Tensor:
     """Construct a random token batch for benchmarking and profiling."""
-    raise NotImplementedError
+    return torch.randint(
+        low=0,
+        high=config.vocab_size,
+        size=(config.batch_size, config.context_length),
+        dtype=torch.long,
+        device=device,
+    )
 
 
 def run_single_step(
@@ -72,27 +96,95 @@ def run_single_step(
     autocast_context,
 ) -> None:
     """Execute one benchmark step and synchronize CUDA before returning."""
-    raise NotImplementedError
+    optimizer = getattr(model, "_benchmark_optimizer", None)
+    if mode == "train-step" and optimizer is None:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        setattr(model, "_benchmark_optimizer", optimizer)
+
+    if mode in {"forward-backward", "train-step"}:
+        model.zero_grad(set_to_none=True)
+
+    with autocast_context:
+        outputs = model(batch)
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs
+        loss = F.cross_entropy(logits[:, :-1].contiguous().view(-1, logits.shape[-1]), batch[:, 1:].contiguous().view(-1))
+
+    if mode in {"forward-backward", "train-step"}:
+        loss.backward()
+    if mode == "train-step":
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+    if batch.is_cuda:
+        torch.cuda.synchronize()
 
 
 def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
     """Run warmup steps followed by timed measurement steps."""
-    raise NotImplementedError
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model(config).to(device)
+    model.train(config.mode != "forward")
+    batch = make_random_batch(config, device)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    autocast_context = make_autocast_context(config.use_bf16 and device.type == "cuda")
+    for _ in range(config.warmup_steps):
+        run_single_step(model, batch, config.mode, autocast_context)
+
+    maybe_start_memory_history(config.use_memory_profiler and device.type == "cuda")
+    timings: list[float] = []
+    for _ in range(config.measure_steps):
+        start = timeit.default_timer()
+        run_single_step(model, batch, config.mode, autocast_context)
+        timings.append(timeit.default_timer() - start)
+    maybe_dump_memory_snapshot(
+        config.use_memory_profiler and device.type == "cuda",
+        config.output_dir / f"{config.model_size}_{config.context_length}_{config.mode}_memory.pickle",
+    )
+
+    result = {
+        "mean_seconds": statistics.fmean(timings),
+        "std_seconds": statistics.stdev(timings) if len(timings) > 1 else 0.0,
+        "min_seconds": min(timings),
+        "max_seconds": max(timings),
+    }
+    print(result)
+    return result
 
 
 def annotated_scaled_dot_product_attention(*args, **kwargs):
     """Optional NVTX-annotated attention path for Nsight Systems profiling."""
-    raise NotImplementedError
+    import torch.cuda.nvtx as nvtx
+    from einops import einsum
+    from basics.nn_utils import softmax
+
+    q = kwargs.get("Q", args[0] if args else None)
+    k = kwargs.get("K", args[1] if len(args) > 1 else None)
+    v = kwargs.get("V", args[2] if len(args) > 2 else None)
+    mask = kwargs.get("mask", args[3] if len(args) > 3 else None)
+    if q is None or k is None or v is None:
+        raise TypeError("expected Q, K, and V tensors")
+
+    with nvtx.range("scaled dot product attention"):
+        with nvtx.range("computing attention scores"):
+            attention_scores = einsum(q, k, "... query d_k, ... key d_k -> ... query key") / math.sqrt(k.shape[-1])
+            if mask is not None:
+                attention_scores = torch.where(mask, attention_scores, float("-inf"))
+        with nvtx.range("computing softmax"):
+            attention_weights = softmax(attention_scores, dim=-1)
+        with nvtx.range("final matmul"):
+            return einsum(attention_weights, v, "... query key, ... key d_v -> ... query d_v")
 
 
 def maybe_start_memory_history(enabled: bool) -> None:
     if enabled:
-        raise NotImplementedError
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
 
 
 def maybe_dump_memory_snapshot(enabled: bool, output_path: Path) -> None:
     if enabled:
-        raise NotImplementedError
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.cuda.memory._dump_snapshot(str(output_path))
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 
 def make_autocast_context(use_bf16: bool):
